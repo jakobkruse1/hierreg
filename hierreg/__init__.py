@@ -3,11 +3,23 @@ from sklearn.base import BaseEstimator
 from scipy.sparse import csc_matrix, csr_matrix, hstack
 from casadi import MX, nlpsol, dot, mtimes, log, sum1
 
+
 class HierarchicalRegression(BaseEstimator):
-    def __init__(self, l2_reg=100.0, l1_reg=0.0, linf_reg=0.0, main_l2_reg=0.0, problem='regression',
-                 fit_intercept=True, weight_by_nobs=True, reweight_deviations=False, standardize=False,
-                 solver_interface='cvxpy', cvxpy_opts={'solver':'SCS', 'max_iters':3000, 'verbose':False},
-                 ipopt_options={"print_level":0,'hessian_approximation':'limited-memory'}):
+    def __init__(
+            self,
+            l2_reg: float = 100.0,
+            l1_reg: float = 0.0,
+            linf_reg: float = 0.0,
+            main_l2_reg: float = 0.0,
+            problem: str = 'regression',
+            fit_intercept: bool = True,
+            weight_by_nobs: bool = True,
+            reweight_deviations: bool = False,
+            standardize: bool = False,
+            solver_interface: str = 'cvxpy',
+            cvxpy_opts: dict = None,
+            ipopt_options: dict = None
+    ):
         """
         Linear regression with group-varying coefficients
         
@@ -113,22 +125,34 @@ class HierarchicalRegression(BaseEstimator):
         class1, class2
             Positive and negative class labels used when outputting predictions (Classification only).
         """
-        self.l1_reg=l1_reg
-        self.l2_reg=l2_reg
-        self.linf_reg=linf_reg
-        self.main_l2_reg=main_l2_reg
-        assert (problem=='regression') or (problem=='classification')
-        self.problem=problem
-        self.fit_intercept=fit_intercept
-        self.weight_by_nobs=weight_by_nobs
-        self.reweight_deviations=reweight_deviations
-        self.standardize=standardize
+        self.l1_reg = l1_reg
+        self.l2_reg = l2_reg
+        self.linf_reg = linf_reg
+        self.main_l2_reg = main_l2_reg
+        assert (problem == 'regression') or (problem == 'classification')
+        self.problem = problem
+        self.fit_intercept = fit_intercept
+        self.weight_by_nobs = weight_by_nobs
+        self.reweight_deviations = reweight_deviations
+        self.standardize = standardize
         assert solver_interface in {'cvxpy', 'casadi'}
-        self.solver_interface=solver_interface
-        self.cvxpy_opts=cvxpy_opts
-        self.ipopt_options=ipopt_options
-    
-    def fit(self,X,y,groups):
+        self.solver_interface = solver_interface
+        self.cvxpy_opts = cvxpy_opts or \
+                          {'solver': 'SCS', 'max_iters': 3000, 'verbose': False}
+        self.ipopt_options = \
+            ipopt_options or \
+            {"print_level": 0, 'hessian_approximation': 'limited-memory'}
+
+        self._gnames = None
+        self.class1 = None
+        self.class2 = None
+        self._gdim = None
+        self.group_effects_ = None
+        self.coef2_ = None
+        self.coef_ = None
+        self._gbin_names = None
+
+    def fit(self, X, y, groups):
         """
         Fit a hierarchical linear regression to data
         
@@ -144,167 +168,191 @@ class HierarchicalRegression(BaseEstimator):
             Values can be strings or numbers, will be one-hot-encoded internally.
             Observations not belonging to any group must have NA values.
         """
-        ## checking input
-        if type(X)==pd.core.frame.DataFrame:
-            x=X.as_matrix()
-            xnames=X.columns.values
-        elif (type(X)==np.ndarray) or (type(X)==np.matrixlib.defmatrix.matrix):
-            x=X.copy()
-            xnames=None
+        # checking input
+        if type(X) == pd.DataFrame:
+            x = X.values
+            xnames = X.columns.values
+        elif (type(X) == np.ndarray) or (
+                type(X) == np.matrixlib.defmatrix.matrix):
+            x = X.copy()
+            xnames = None
         else:
             raise ValueError("'X' must be a pandas data frame or numpy array")
-            
-        if (type(y)==pd.core.frame.DataFrame) or (type(y)==pd.core.series.Series):
-            yval=y.as_matrix()
-        elif (type(y)==np.ndarray) or (type(y)==np.matrixlib.defmatrix.matrix):
-            yval=y.copy()
+
+        if (type(y) == pd.DataFrame) or (
+                type(y) == pd.Series):
+            yval = y.values
+        elif (type(y) == np.ndarray) or (
+                type(y) == np.matrixlib.defmatrix.matrix):
+            yval = y.copy()
         else:
-            raise ValueError("'y' must be a pandas data frame, pandas series, or numpy array")
-            
-        if self.problem=='classification':
-            classes=set(yval)
-            if len(classes)!=2:
-                raise ValueError("Only binary classification is supported. 'y' contains "+str(len(classes))+" values")
+            raise ValueError(
+                "'y' must be a pandas data frame, pandas series, or numpy array")
+
+        if self.problem == 'classification':
+            classes = set(yval)
+            if len(classes) != 2:
+                raise ValueError(
+                    "Only binary classification is supported. 'y' contains " + str(
+                        len(classes)) + " values")
             if (1 in classes) and ((-1) in classes):
-                self.class1=1
-                self.class2=-1
+                self.class1 = 1
+                self.class2 = -1
             elif (1 in classes) and (0 in classes):
-                yval[yval==0]=-1.0
-                self.class1=1
-                self.class2=0
+                yval[yval == 0] = -1.0
+                self.class1 = 1
+                self.class2 = 0
             else:
-                self.class1,self.class2=tuple(classes)
-                yval[yval==class1]=1.0
-                yval[yval==class2]=-1.0
-            
-        if type(groups)==pd.core.series.Series:
-            gbin=pd.get_dummies(np.array(groups.astype('str')))
-            self._gdim=1
-            self._gnames=''
-        elif type(groups)==pd.core.frame.DataFrame:
-            self._gdim=groups.shape[1]
-            self._gnames=list(groups.columns.values)
-            gbin=pd.get_dummies(groups.astype('str'))
-        elif (type(groups)==np.ndarray) or (type(groups)==np.matrixlib.defmatrix.matrix):
+                self.class1, self.class2 = tuple(classes)
+                yval[yval == self.class1] = 1.0
+                yval[yval == self.class2] = -1.0
+
+        if type(groups) == pd.Series:
+            gbin = pd.get_dummies(np.array(groups.astype('str')))
+            self._gdim = 1
+            self._gnames = ''
+        elif type(groups) == pd.DataFrame:
+            self._gdim = groups.shape[1]
+            self._gnames = list(groups.columns.values)
+            gbin = pd.get_dummies(groups.astype('str'))
+        elif (type(groups) == np.ndarray) or (
+                type(groups) == np.matrixlib.defmatrix.matrix):
             try:
-                self._gdim=groups.shape[1]
+                self._gdim = groups.shape[1]
             except:
-                self._gdim=1
-            gr=pd.DataFrame(groups,columns=['X'+str(i) for i in range(self._gdim)]).astype('str')
-            self._gnames=gr.columns.values
-            gbin=pd.get_dummies(gr.astype('str'))
+                self._gdim = 1
+            gr = pd.DataFrame(groups, columns=['X' + str(i) for i in
+                                               range(self._gdim)]).astype('str')
+            self._gnames = gr.columns.values
+            gbin = pd.get_dummies(gr.astype('str'))
             del gr
         else:
-            raise ValueError("'groups' must be a pandas data frame, pandas series, or numpy array")
-            
-        ## processing X as specified
+            raise ValueError(
+                "'groups' must be a pandas data frame, pandas series, or numpy array")
+
+        # processing X as specified
         if self.standardize:
-            xmeans=x.mean(axis=0)
-            xsd=x.std(axis=0)
-            x=(x-xmeans)/xsd
-        
+            xmeans = x.mean(axis=0)
+            xsd = x.std(axis=0)
+            x = (x - xmeans) / xsd
+
         if self.fit_intercept or self.standardize:
-            x=np.hstack([np.ones((x.shape[0],1)), x])
+            x = np.hstack([np.ones((x.shape[0], 1)), x])
             if xnames is not None:
-                xnames=['Intercept']+list(xnames)
-        nobs=x.shape[0]
-        nvar=x.shape[1]
-        assert gbin.shape[0]==nobs
-        assert yval.shape[0]==nobs
-        
-        ## putting one-hot-encd' groups into a wide numpy array
-        self._gbin_names=list(gbin.columns.values)
-        ngroupvar=len(self._gbin_names)
-        nweight=1/gbin.sum(axis=0)
-        ntot=np.sum(nweight)
-        nweight=nweight/ntot
-        nweight=np.hstack([nweight for g in range(nvar)])/nvar
-        
-        gbin=csc_matrix(gbin.as_matrix())
-        gbin=hstack([gbin.multiply(x[:,g].reshape(-1,1)) for g in range(nvar)])
-        gbin=csr_matrix(gbin)
-        
-        ## modeling the problem
-        if self.solver_interface=='cvxpy':
-            w=cvx.Variable(nvar)
-            v=cvx.Variable(ngroupvar*nvar)
-            if self.problem=='regression':
-                obj=cvx.norm(yval-x*w-gbin*v)/np.sqrt(nobs)
+                xnames = ['Intercept'] + list(xnames)
+        nobs = x.shape[0]
+        nvar = x.shape[1]
+        assert gbin.shape[0] == nobs
+        assert yval.shape[0] == nobs
+
+        # putting one-hot-encd' groups into a wide numpy array
+        self._gbin_names = list(gbin.columns.values)
+        ngroupvar = len(self._gbin_names)
+        nweight = 1 / gbin.sum(axis=0)
+        ntot = np.sum(nweight)
+        nweight = nweight / ntot
+        nweight = np.hstack([nweight for g in range(nvar)]) / nvar
+
+        gbin = csc_matrix(gbin.values)
+        gbin = hstack(
+            [gbin.multiply(x[:, g].reshape(-1, 1)) for g in range(nvar)])
+        gbin = csr_matrix(gbin)
+
+        # modeling the problem
+        if self.solver_interface == 'cvxpy':
+            w = cvx.Variable(nvar)
+            v = cvx.Variable(ngroupvar * nvar)
+            if self.problem == 'regression':
+                obj = cvx.norm(yval - x * w - gbin * v) / np.sqrt(nobs)
             else:
-                obj=cvx.sum_entries(cvx.logistic(cvx.mul_elemwise(-yval,x*w+gbin*v)))/nobs
+                obj = cvx.sum_entries(
+                    cvx.logistic(cvx.multiply(-yval, x * w + gbin * v))) / nobs
             if self.reweight_deviations:
-                if self.main_l2_reg>0:
-                    obj+=self.main_l2_reg*cvx.norm(w)
-                D=cvx.Variable(nvar, nvar)
+                if self.main_l2_reg > 0:
+                    obj += self.main_l2_reg * cvx.norm(w)
+                D = cvx.Variable(nvar, nvar)
                 for g in range(ngroupvar):
                     if self.weight_by_nobs:
-                        obj+=l2_reg*cvx.matrix_frac(cvx.mul_elemwise(nweight[ngroupvar],v[[i for i in range(g,gbin.shape[1],ngroupvar)]]),D)
+                        obj += self.l2_reg * cvx.matrix_frac(
+                            cvx.multiply(nweight[ngroupvar], v[[i for i in
+                                                                range(g,
+                                                                      gbin.shape[
+                                                                          1],
+                                                                      ngroupvar)]]),
+                            D)
                     else:
-                        obj+=l2_reg*cvx.matrix_frac(v[[i for i in range(g,gbin.shape[1],ngroupvar)]],D)
-                prob=cvx.Problem(cvx.Minimize(obj), [cvx.trace(D)==1])
+                        obj += self.l2_reg * cvx.matrix_frac(
+                            v[[i for i in range(g, gbin.shape[1], ngroupvar)]],
+                            D)
+                prob = cvx.Problem(cvx.Minimize(obj), [cvx.trace(D) == 1])
             else:
-                if self.main_l2_reg>0:
-                    obj+=self.main_l2_reg*cvx.norm(w)
-                if self.l1_reg>0:
+                if self.main_l2_reg > 0:
+                    obj += self.main_l2_reg * cvx.norm(w)
+                if self.l1_reg > 0:
                     if self.weight_by_nobs:
-                        obj+=self.l1_reg*cvx.norm(cvx.mul_elemwise(nweight,v),1)
+                        obj += self.l1_reg * cvx.norm(cvx.multiply(nweight, v),
+                                                      1)
                     else:
-                        obj+=self.l1_reg*cvx.norm(v,1)
-                if self.l2_reg>0:
+                        obj += self.l1_reg * cvx.norm(v, 1)
+                if self.l2_reg > 0:
                     if self.weight_by_nobs:
-                        obj+=self.l2_reg*cvx.norm(cvx.mul_elemwise(nweight,v),2)
+                        obj += self.l2_reg * cvx.norm(cvx.multiply(nweight, v),
+                                                      2)
                     else:
-                        obj+=self.l2_reg*cvx.norm(v,2)
-                if self.linf_reg>0:
-                    obj+=self.linf_reg*cvx.norm(v,'inf')
-                prob=cvx.Problem(cvx.Minimize(obj))
+                        obj += self.l2_reg * cvx.norm(v, 2)
+                if self.linf_reg > 0:
+                    obj += self.linf_reg * cvx.norm(v, 'inf')
+                prob = cvx.Problem(cvx.Minimize(obj))
             prob.solve(**self.cvxpy_opts)
 
-            ## saving results
-            self.coef_=np.array(w.value)
-            self.coef2_=np.array(v.value)
-            
-        if self.solver_interface=='casadi':
-            xvars=MX.sym('Vars',nvar*(1+ngroupvar))
-            w=xvars[:nvar]
-            v=xvars[nvar:]
-            pred=mtimes(x,w)+mtimes(gbin,v)
-            if self.problem=='regression':
-                err=yval-pred
-                obj=dot(err,err)/nobs
-            else:
-                obj=sum1(log(1+np.exp(-yval*pred)))/nobs
-                
-            if self.weight_by_nobs:
-                regw=nweight*v
-            else:
-                regw=v
-            obj+=self.l2_reg*dot(regw,regw)
-            if self.main_l2_reg>0:
-                obj+=self.main_l2_reg*dot(w,w)
+            # saving results
+            self.coef_ = np.array(w.value)
+            self.coef2_ = np.array(v.value)
 
-            solver = nlpsol("solver", "ipopt", {'x':xvars,'f':obj},{'print_time':False,'ipopt':self.ipopt_options})
-            x0=np.zeros(shape=nvar*(1+ngroupvar))
-            res=solver(x0=x0)
-            
-            ## saving results
-            self.coef_=np.array(res['x'][:nvar])
-            self.coef2_=np.array(res['x'][nvar:])
-        
-        
+        if self.solver_interface == 'casadi':
+            xvars = MX.sym('Vars', nvar * (1 + ngroupvar))
+            w = xvars[:nvar]
+            v = xvars[nvar:]
+            pred = mtimes(x, w) + mtimes(gbin, v)
+            if self.problem == 'regression':
+                err = yval - pred
+                obj = dot(err, err) / nobs
+            else:
+                obj = sum1(log(1 + np.exp(-yval * pred))) / nobs
+
+            if self.weight_by_nobs:
+                regw = nweight * v
+            else:
+                regw = v
+            obj += self.l2_reg * dot(regw, regw)
+            if self.main_l2_reg > 0:
+                obj += self.main_l2_reg * dot(w, w)
+
+            solver = nlpsol("solver", "ipopt", {'x': xvars, 'f': obj},
+                            {'print_time': False, 'ipopt': self.ipopt_options})
+            x0 = np.zeros(shape=nvar * (1 + ngroupvar))
+            res = solver(x0=x0)
+
+            # saving results
+            self.coef_ = np.array(res['x'][:nvar])
+            self.coef2_ = np.array(res['x'][nvar:])
+
         if self.standardize:
-            div=np.array([1]+list(xsd))
-            self.coef_=self.coef_.reshape(-1)/div
-            self.coef2_=self.coef2_.reshape(-1)/np.hstack([[div[i]]*ngroupvar for i in range(nvar)])
-            self.coef_[0]-=np.sum(self.coef_[1:]*xmeans)
-            xmeans=[0]+list(xmeans)
-            self.coef_[0]-=np.sum(self.coef2_*np.hstack([[xmeans[i]]*ngroupvar for i in range(nvar)]))
-        
-        self.group_effects_=pd.DataFrame(self.coef2_.reshape(nvar,ngroupvar),columns=self._gbin_names)
+            div = np.array([1] + list(xsd))
+            self.coef_ = self.coef_.reshape(-1) / div
+            self.coef2_ = self.coef2_.reshape(-1) / np.hstack(
+                [[div[i]] * ngroupvar for i in range(nvar)])
+            self.coef_[0] -= np.sum(self.coef_[1:] * xmeans)
+            xmeans = [0] + list(xmeans)
+            self.coef_[0] -= np.sum(self.coef2_ * np.hstack(
+                [[xmeans[i]] * ngroupvar for i in range(nvar)]))
+
+        self.group_effects_ = pd.DataFrame(self.coef2_.reshape(nvar, ngroupvar),
+                                           columns=self._gbin_names)
         if xnames is not None:
-            self.group_effects_.index=xnames
-    
-    def predict(self,X,groups,prob=False):
+            self.group_effects_.index = xnames
+
+    def predict(self, X, groups, prob=False):
         """
         Predict values using this model
         
@@ -326,72 +374,85 @@ class HierarchicalRegression(BaseEstimator):
         numpy array
             Predicted values.
         """
-        ## checking input
-        if type(X)==pd.core.frame.DataFrame:
-            x=X.as_matrix()
-        elif (type(X)==np.ndarray) or (type(X)==np.matrixlib.defmatrix.matrix):
-            x=X.copy()
+        # checking input
+        if type(X) == pd.DataFrame:
+            x = X.values
+        elif (type(X) == np.ndarray) or (
+                type(X) == np.matrixlib.defmatrix.matrix):
+            x = X.copy()
         else:
             raise ValueError("'X' must be a pandas data frame or numpy array")
-            
-        ## adding intercept if necessary
+
+        # adding intercept if necessary
         if self.fit_intercept or self.standardize:
-            x=np.hstack([np.ones((x.shape[0],1)), x])
-        
-        ## processing groups variable
-        if type(groups)==pd.core.series.Series:
-            if self._gdim!=1:
-                raise ValueError("Model was fit with 1-dimensional groups. Must pass a 1-dimensional group array for predictions.")
-            gbin=pd.get_dummies(np.array(groups.astype('str')))
-        elif type(groups)==pd.core.frame.DataFrame:
-            if list(groups.columns.values)!=self._gnames:
-                if groups.shape[1]<self._gdim:
-                    raise ValueError("'groups' must contain information about "+str(self._gnames))
-                elif groups.shape[1]==self._gdim:
-                    gr=groups.copy()
-                    gr.columns=self._gnames
+            x = np.hstack([np.ones((x.shape[0], 1)), x])
+
+        # processing groups variable
+        if type(groups) == pd.Series:
+            if self._gdim != 1:
+                raise ValueError(
+                    "Model was fit with 1-dimensional groups. Must pass a 1-dimensional group array for predictions.")
+            gbin = pd.get_dummies(np.array(groups.astype('str')))
+        elif type(groups) == pd.DataFrame:
+            if list(groups.columns.values) != self._gnames:
+                if groups.shape[1] < self._gdim:
+                    raise ValueError(
+                        "'groups' must contain information about " + str(
+                            self._gnames))
+                elif groups.shape[1] == self._gdim:
+                    gr = groups.copy()
+                    gr.columns = self._gnames
                 else:
                     for cl in self._gnames:
                         if cl not in groups.columns.values:
-                            raise ValueError("'groups' must contain information about "+str(self._gnames))
-                    gr=groups[self._gnames]
-                gbin=pd.get_dummies(gr.astype('str'))
+                            raise ValueError(
+                                "'groups' must contain information about " + str(
+                                    self._gnames))
+                    gr = groups[self._gnames]
+                gbin = pd.get_dummies(gr.astype('str'))
             else:
-                gbin=pd.get_dummies(groups.astype('str'))
-        elif (type(groups)==np.ndarray) or (type(groups)==np.matrixlib.defmatrix.matrix):
-            if len(groups.shape)==1:
-                if self._gdim!=1:
-                    raise ValueError("Model was fit with 1-dimensional groups. Must pass a 1-dimensional group array for predictions.")
-                gbin=pd.get_dummies(groups.astype('str'))
+                gbin = pd.get_dummies(groups.astype('str'))
+        elif (type(groups) == np.ndarray) or (
+                type(groups) == np.matrixlib.defmatrix.matrix):
+            if len(groups.shape) == 1:
+                if self._gdim != 1:
+                    raise ValueError(
+                        "Model was fit with 1-dimensional groups. Must pass a 1-dimensional group array for predictions.")
+                gbin = pd.get_dummies(groups.astype('str'))
             else:
-                if self._gdim==1:
-                    raise ValueError("Model was fit with 1-dimensional groups. Must pass a 1-dimensional group array for predictions.")
-                if groups.shape[1]!=self._gdim:
-                    raise ValueError("'groups' must contain information about "+str(self._gnames))
-                gr=pd.DataFrame(groups,columns=self._gnames).astype('str')
-                gbin=pd.get_dummies(gr.astype('str'))
+                if self._gdim == 1:
+                    raise ValueError(
+                        "Model was fit with 1-dimensional groups. Must pass a 1-dimensional group array for predictions.")
+                if groups.shape[1] != self._gdim:
+                    raise ValueError(
+                        "'groups' must contain information about " + str(
+                            self._gnames))
+                gr = pd.DataFrame(groups, columns=self._gnames).astype('str')
+                gbin = pd.get_dummies(gr.astype('str'))
                 del gr
         else:
-            raise ValueError("'groups' must be a pandas data frame, pandas series, or numpy array")
-            
+            raise ValueError(
+                "'groups' must be a pandas data frame, pandas series, or numpy array")
+
         missing_cols = set(self._gbin_names) - set(gbin.columns)
         for c in missing_cols:
             gbin[c] = 0
         gbin = gbin[self._gbin_names]
-        gbin=csc_matrix(gbin.as_matrix())
-        gbin=hstack([gbin.multiply(x[:,g].reshape(-1,1)) for g in range(self.coef_.shape[0])])
-        
-        ## applying coefficients
-        pred=(x.dot(self.coef_)+gbin.dot(self.coef2_)).reshape(-1)
-        
-        ## returning output in the appropriate format
-        if self.problem=='regression':
+        gbin = csc_matrix(gbin.values)
+        gbin = hstack([gbin.multiply(x[:, g].reshape(-1, 1)) for g in
+                       range(self.coef_.shape[0])])
+
+        # applying coefficients
+        pred = (x.dot(self.coef_) + gbin.dot(self.coef2_)).reshape(-1)
+
+        # returning output in the appropriate format
+        if self.problem == 'regression':
             return pred
         else:
             if prob:
-                return 1/(1+np.exp(-pred))
+                return 1 / (1 + np.exp(-pred))
             else:
-                outclass=pred>=0
-                pred[outclass]=self.class1
-                pred[~outclass]=self.class2
+                outclass = pred >= 0
+                pred[outclass] = self.class1
+                pred[~outclass] = self.class2
                 return pred

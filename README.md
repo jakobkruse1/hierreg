@@ -1,4 +1,8 @@
-# hierreg
+# Hierarchical Regression -  Multilevel modeling in Python
+
+This fork of https://github.com/david-cortes/hierreg updates package dependencies and fixes some bugs that are present in the original repository.
+
+Original README:
 
 This is a Python package intended for fitting linear models whose coefficients can have some deviation according to groups to which observations belong, in a similar way as multilevel / random effects and hierarchical bayes models, but following more of a ‘statistical leaning’ procedure for the estimation, by applying regularization to group deviations (random effects).
 
